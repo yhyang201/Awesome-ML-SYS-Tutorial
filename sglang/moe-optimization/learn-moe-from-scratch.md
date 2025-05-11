@@ -142,11 +142,162 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 简而言之，就是循环迭代每一个 expert 进行计算。
 
 
+## FusedMoE
+
+FusedMoE 的核心思想是将原生实现中分散的、开销大的操作“融合”到少数几个（甚至一个）高度优化的自定义 GPU Kernel 中，以大幅提升性能。
+
+FusedMoE:
+
+`__init__`:  BF16版本使用 `UnquantizedFusedMoEMethod`
+
+`forward`: 
+```
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        assert self.quant_method is not None
+
+        # Matrix multiply.
+        final_hidden_states = self.quant_method.apply(
+            layer=self,
+            x=hidden_states,
+            router_logits=router_logits,
+            top_k=self.top_k,
+            renormalize=self.renormalize,
+            use_grouped_topk=self.use_grouped_topk,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            custom_routing_function=self.custom_routing_function,
+            correction_bias=self.correction_bias,
+            activation=self.activation,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+
+        if self.reduce_results and self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        return final_hidden_states
+```
 
 
+UnquantizedFusedMoEMethod:
 
 
+```
+    def forward_cuda(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
+        )
 
+        if _is_hip and get_bool_env_var("SGLANG_AITER_MOE"):
+            assert not no_combine, "unsupported"
+            return ck_moe_2stages(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                activation=(
+                    ActivationType.Silu if activation == "silu" else ActivationType.Gelu
+                ),
+            )
+        else:
+            return fused_experts(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=inplace and not no_combine,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                no_combine=no_combine,
+            )
+
+    def forward_cpu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        inplace: bool = True,
+    ) -> torch.Tensor:
+        return moe_forward_native(
+            layer,
+            x,
+            use_grouped_topk,
+            top_k,
+            router_logits,
+            renormalize,
+            topk_group,
+            num_expert_group,
+            custom_routing_function,
+            correction_bias,
+        )
+```
+注意，在 cuda graph capture 时，会执行：
+```
+def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
+    for sub in model._modules.values():
+        if isinstance(sub, CustomOp):
+            if reverse:
+                sub._forward_method = sub.forward_cuda
+                setattr(sub, "is_torch_compile", False)
+            else:
+                # NOTE: Temporarily workaround MoE
+                if "FusedMoE" in sub.__class__.__name__:
+                    if num_tokens == 1:
+                        # The performance of torch.compile on this layer is not always good when bs > 1,
+                        # so we decide to only use torch.compile when bs =1
+                        sub._forward_method = fused_moe_forward_native
+                else:
+                    sub._forward_method = sub.forward_native
+                setattr(sub, "is_torch_compile", True)
+        if isinstance(sub, torch.nn.Module):
+            _to_torch(sub, reverse, num_tokens)
+```
+
+
+## EP Moe
+
+TODO 
+
+ref: 
+
+https://zhuanlan.zhihu.com/p/21251657579
+
+https://zhuanlan.zhihu.com/p/17790182311
 
 
 
