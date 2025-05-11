@@ -253,3 +253,90 @@ hybrid data and tensor parallelism 是什么？
 
 
 # Evaluation
+## End-to-end Performance
+### Experimental Setup
+
+> 我们在由 12 个节点组成的集群上，使用 DeepSeek-V3 对 SGLang 的不同配置进行了端到端性能评估。该集群通过 InfiniBand 互联，每个节点配备 8 张 H100 GPU。本次评估旨在展示我们所采用的多项高级优化技术带来的吞吐量提升。我们比较了以下四种配置：
+>
+> 1. **SGLang（TP16 × 6 配置）**：每两个节点组成一个独立分组，以张量并行规模为 16（TP size = 16）运行 DeepSeek-V3 推理，并启用数据并行注意力（DP attention）。
+>
+> 2. **SGLang + PD 分离（PD Disaggregation）**：该版本加入了 PD 分离机制，并实现了完整的专家并行优化（EP optimization）。在 EPLB（专家负载均衡器）部分，我们采用了与输入/输出数据相匹配的专家分布（因为实时服务统计数据尚不可用）。
+> 
+> 3. **SGLang + PD 分离 + 模拟 MTP**：为模拟 MTP（Multi-Token Prediction）的效果，我们将批次大小加倍，同时将 KV 缓存长度减半，以保持 GroupedGeMM 的计算量与内存访问开销不变。此外，我们在真实的注意力计算之后插入了 dummy 内核，确保 attention 阶段的耗时与 DeepSeek 的性能分析保持一致，准确反映 MTP 注意力机制带来的减速。我们保守地假设 MTP 的 token 接受率为 70%。
+>
+> 4. **DeepSeek Profile 结果（DeepSeek Profile Results）**：该结果基于 DeepSeek 官方提供的性能分析数据所得出的吞吐量估计。
+>
+
+### Performance Analysis of Prefill and Decode Phases
+
+> 为了应对不同的工作负载需求，我们分别独立评估了预填充阶段（Prefill，简称P）和解码阶段（Decode，简称D），在测试某一阶段时，假设另一阶段拥有无限资源，以此隔离并最大化测试节点的负载——这种设置方式与 DeepSeek 所采用的方法一致。结果如下总结：
+>
+> **预填充阶段**：在4个节点上（4×8×H100，EP32），系统在提示长度为1K、2K 和 4K 时分别实现了每个节点每秒57,674、54,543 和 50,302个tokens的吞吐率。如下面的柱状图所示，这相比TP16基线最多提升了3.3倍，主要得益于优化后的GroupedGeMM内核（DeepGEMM）以及双批次重叠技术。在工作负载完美平衡的假设下，我们系统的吞吐率比 DeepSeek 的官方数据仅低5.6%。
+>
+> **解码阶段**：在9个节点上进行评估（9×8×H100，EP72；为 DeepSeek 规模的一半），系统在2K输入下每个节点达到22,282 tokens/秒的吞吐率，相比TP16基线提升了5.2倍。在模拟的MTP（多任务推理）条件下——通过刻意降低注意力内核速度以贴近实际延迟——系统在4K输入下仍保持每节点17,373 tokens/秒的高吞吐，仅比 DeepSeek 官方数据低6.6%。如右图所示，这些性能提升主要归功于EP支持的4倍更大批次大小，极大减少了每个GPU的模型权重内存占用，从而提升了可扩展性。
+>
+> ![image](https://github.com/user-attachments/assets/a8f30ba0-33ac-4a2b-856c-3cc56f21dd1e)
+
+
+# Toolkits
+
+## Disposable Tensor
+
+> 在 PyTorch 中进行内存管理可能会比较棘手，尤其是在对 GPU 资源要求较高的工作流程中，因为 CUDA 内存是一种稀缺资源。其中一个常见问题是对象引用的持续存在。请看以下示例：
+>
+> ```python
+> def ffn(hidden_state: torch.Tensor, linear1: nn.Linear, linear2: nn.Linear):
+>    intermediate_state = linear1(hidden_state)
+>    del hidden_state  # 尝试释放内存，但由于外部引用，实际上无效
+>    return linear2(nn.ReLU(intermediate_state))
+>
+> hidden_state = ffn(hidden_state, linear1, linear2)
+> ```
+>
+> 在这段代码中，`del hidden_state` 旨在在计算完 `intermediate_state` 后释放 `hidden_state` 占用的内存。但由于 `hidden_state` 在函数外部仍然有引用，`del` 操作不会真正释放内存。这会导致峰值内存使用量增加，从而可能带来性能下降或触发内存溢出错误。
+>
+> **SGLang** 通过引入 `DisposableTensor` 类来解决这一问题。`DisposableTensor` 是 `torch.Tensor` 的一个子类，新增了 `dispose()` 方法，能够显式并立即释放张量的内存，从而绕过 Python 的引用计数机制限制。以下是使用方式：
+> 
+> ```python
+> def ffn(hidden_state: torch.Tensor, linear1: nn.Linear, linear2: nn.Linear):
+>    intermediate_state = linear1(hidden_state)
+>    hidden_state.dispose()  # 立即释放 CUDA 内存
+>    return linear2(nn.ReLU(intermediate_state))
+>
+> # 使用 DisposableTensor 包装张量
+> hidden_state = DisposableTensor(hidden_state)
+> hidden_state = ffn(hidden_state, linear1, linear2)
+>```
+>
+> 通过将 `hidden_state` 包装为 `DisposableTensor` 并在不再需要时调用 `dispose()`，CUDA 内存可以被立刻释放。这确保了在张量完成其计算任务后，相关内存能够被及时回收，从而降低了峰值内存使用并提升了整体效率。
+
+## Expert Workload Extraction and Simulation
+
+> SGLang 还提供了一套用于分析和模拟 MoE（混合专家）模型中专家负载分布的工具集。该功能使用户能够：
+> 
+> **导出专家负载统计数据**：可以提取累计统计信息或每个 batch 的负载数据。累计统计适用于 EPLB 管理器进行实时优化，而每 batch 的数据则为分析与模拟提供了更细致的洞察。
+> 
+> **模拟专家使用情况**：无需昂贵的硬件或多次试验，即可在多种配置下建模专家负载的平衡情况。例如，用户可以在较小规模的环境（如 2×8×H100 或 8×H200）中收集负载数据，并据此模拟在 22 个节点的大规模部署下的性能表现。
+> 
+> 该模拟功能使用户能够评估如**再平衡频率**、**节点数量**或**批次大小**等因素对系统性能的影响，是在大规模部署前优化配置的经济高效方式。
+
+# Limitations and Future Work
+
+> 尽管我们为 DeepSeek-V3 推理实现的 SGLang 展示了显著的吞吐率提升，但仍存在一些局限性和未来可改进的方向：
+> 
+> **延迟优化**：目前主要聚焦于吞吐率优化，导致首个 Token 输出时间（TTFT）在 2–5 秒之间，Token 间延迟（ITL）约为 100 毫秒。若应用于实时场景，仍需进一步优化延迟表现。
+>
+> **序列长度限制**：由于使用了 96 张 GPU，目前仅支持较短的输入序列。若扩展 GPU 资源，将能够支持更长序列，这是某些特定应用场景所必需的。
+>
+> **多 Token 预测（MTP）集成**：SGLang 已支持 MTP，但尚未与 DP（数据并行）注意力机制完全集成，在混合并行配置中会降低效率。
+>
+> **EPLB 分布问题**：本次实验使用的是分布内数据进行专家并行负载均衡器（EPLB）的评估，可能无法真实反映实际场景中的数据变化。未来工作应考虑在分布转移（distribution shift）下测试其性能。
+>
+> **灵活的张量并行（TP）规模**：在 DeepSeek-V3 中，内存最优的密集前馈网络（FFN）的 TP 规模较小，但通常大于 1。当前 SGLang 仅支持纯 TP 或纯 DP，这在内存使用上可能不够高效，未来需要支持更灵活的 TP 配置。
+> 
+> **Blackwell 架构支持**：目前实现仅支持 NVIDIA Hopper 架构，我们正在积极开发对下一代 Blackwell 架构的兼容性。如果您有意支持或赞助该开发，欢迎联系 [lmsys.org@gmail.com](mailto:lmsys.org@gmail.com)。
+
+# Conclusion
+
+> 通过利用 PD 解耦（Prefill-Decode 分离）、EP（专家并行）以及精心设计的并行策略，我们在 SGLang 中高效复现了 DeepSeek 的推理框架，并实现了卓越的性能表现。我们的开源成果达到了每秒 52,300 个输入 token 和 22,300 个输出 token 的吞吐率，充分展示了 SGLang 在大规模大语言模型推理中的强大能力。我们诚挚邀请社区一同探索、复现并拓展这一工作，推动高效 AI 部署的边界。
+
